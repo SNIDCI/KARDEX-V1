@@ -52,11 +52,15 @@ function fmtQty(n) {
 
 // Convertit un nombre d'unités vendues/reçues en équivalent-cartons, selon le colisage.
 // Ex : colisage 6 → 1 unité = 0,167 carton, 2 unités = 0,334, ... 6 unités = 1 carton.
+// Si le nombre d'unités dépasse le colisage, les cartons entiers sont d'abord extraits :
+// colisage 12, 43 unités → 3 cartons entiers + 7 unités restantes = 3,581 carton(s).
 function unitesEnCartons(unites, colisage) {
   if (!colisage || colisage <= 1) return unites;
-  if (unites % colisage === 0) return unites / colisage;
+  const cartonsEntiers = Math.floor(unites / colisage);
+  const reste = unites - cartonsEntiers * colisage;
+  if (reste === 0) return cartonsEntiers;
   const fractionUnitaire = Math.round((1 / colisage) * 1000) / 1000;
-  return Math.round(fractionUnitaire * unites * 1000) / 1000;
+  return Math.round((cartonsEntiers + fractionUnitaire * reste) * 1000) / 1000;
 }
 
 function fmtDate(d) {
@@ -244,7 +248,13 @@ export default function KardexApp({ profile, onLogout }) {
           />
         )}
         {view === "commande" && (
-          <CommandeView ruptures={ruptures} objectifsByCode={objectifsByCode} stockByCode={stockByCode} onBack={() => setView("dashboard")} />
+          <CommandeView
+            ruptures={ruptures}
+            objectifsByCode={objectifsByCode}
+            stockByCode={stockByCode}
+            magasinNom={(profile && profile.magasin_nom) || "Mon Magasin"}
+            onBack={() => setView("dashboard")}
+          />
         )}
         {view === "kardex" && (
           <KardexView
@@ -422,7 +432,7 @@ function Dashboard({ valeurStock, suiviCodes, ruptures, stockFaible, articlesAct
   );
 }
 
-function CommandeView({ ruptures, objectifsByCode, stockByCode, onBack }) {
+function CommandeView({ ruptures, objectifsByCode, stockByCode, magasinNom, onBack }) {
   const lignes = useMemo(() => {
     return ruptures
       .map((code) => ARTICLES_BY_CODE[code])
@@ -438,14 +448,16 @@ function CommandeView({ ruptures, objectifsByCode, stockByCode, onBack }) {
   const sansObjectif = lignes.filter((l) => l.objectif <= 0).length;
 
   function telecharger() {
-    const rows = lignes.map((l) => ({
-      Code: l.art.code,
-      Désignation: l.art.designation,
-      "Qté actuelle": l.stock,
-      "Qté voulue": l.objectif > 0 ? l.objectif : "",
-      "Qté à commander": l.aCommander !== null ? l.aCommander : "",
-    }));
-    const ws = XLSX.utils.json_to_sheet(rows);
+    const entete = [[magasinNom], [`Fiche de commande — ${fmtDate(todayISO())}`], []];
+    const colonnes = ["Code", "Désignation", "Qté actuelle", "Qté voulue", "Qté à commander"];
+    const lignesData = lignes.map((l) => [
+      l.art.code,
+      l.art.designation,
+      l.stock,
+      l.objectif > 0 ? l.objectif : "",
+      l.aCommander !== null ? l.aCommander : "",
+    ]);
+    const ws = XLSX.utils.aoa_to_sheet([...entete, colonnes, ...lignesData]);
     ws["!cols"] = [{ wch: 10 }, { wch: 45 }, { wch: 13 }, { wch: 13 }, { wch: 16 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Commande");
@@ -454,10 +466,14 @@ function CommandeView({ ruptures, objectifsByCode, stockByCode, onBack }) {
 
   return (
     <div>
+      <div className="kx-commande-entete">
+        <div className="kx-commande-entete-magasin">{magasinNom}</div>
+        <div className="kx-commande-entete-date">{fmtDate(todayISO())}</div>
+      </div>
       <header className="kx-page-header kx-commande-header">
         <div>
           <h1>Fiche de commande</h1>
-          <p>Articles en rupture — quantité à commander pour atteindre la Qté voulue, au {fmtDate(todayISO())}.</p>
+          <p>Articles en rupture — quantité à commander pour atteindre la Qté voulue.</p>
         </div>
         <div className="kx-commande-actions">
           <button className="kx-btn-ghost" onClick={onBack}>
@@ -551,7 +567,7 @@ function ArticleAutocomplete({ onSelect }) {
               <div>
                 <div className="ac-name">{a.designation}</div>
                 <div className="ac-meta">
-                  {a.code} · {catMeta(a.categorie).label} · {a.fournisseur}
+                  {a.code} · {catMeta(a.categorie).label}
                 </div>
               </div>
             </div>
@@ -565,8 +581,8 @@ function ArticleAutocomplete({ onSelect }) {
 function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, addMouvement }) {
   const art = selectedCode ? ARTICLES_BY_CODE[selectedCode] : null;
   const [type, setType] = useState("entree");
-  const [uniteSaisie, setUniteSaisie] = useState("carton"); // "carton" | "unite"
-  const [quantite, setQuantite] = useState("");
+  const [cartonsSaisis, setCartonsSaisis] = useState("");
+  const [unitesSaisies, setUnitesSaisies] = useState("");
   const [date, setDate] = useState(todayISO());
   const [motif, setMotif] = useState(MOTIFS_ENTREE[0]);
   const [reference, setReference] = useState("");
@@ -576,8 +592,8 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
   }, [type]);
 
   useEffect(() => {
-    setUniteSaisie("carton");
-    setQuantite("");
+    setCartonsSaisis("");
+    setUnitesSaisies("");
   }, [selectedCode]);
 
   const [pending, setPending] = useState(null);
@@ -604,17 +620,19 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
 
   const colisage = art ? art.colisage : 1;
   const peutSaisirEnUnite = colisage > 1;
-  const quantiteSaisie = parseFloat(quantite);
-  const quantiteEnCartons =
-    !isNaN(quantiteSaisie) && quantiteSaisie > 0
-      ? uniteSaisie === "unite"
-        ? unitesEnCartons(quantiteSaisie, colisage)
-        : Math.round(quantiteSaisie * 1000) / 1000
-      : null;
+
+  const cartonsVal = parseFloat(cartonsSaisis) || 0;
+  const unitesVal = parseInt(unitesSaisies, 10) || 0;
+  const cartonsEntiersExtraits = unitesVal > 0 ? Math.floor(unitesVal / colisage) : 0;
+  const unitesRestantes = unitesVal > 0 ? unitesVal - cartonsEntiersExtraits * colisage : 0;
+  const unitesConverties = unitesVal > 0 ? unitesEnCartons(unitesVal, colisage) : 0;
+  const quantiteTotale = Math.round((cartonsVal + unitesConverties) * 1000) / 1000;
+  const quantiteEnCartons = quantiteTotale > 0 ? quantiteTotale : null;
 
   function doSubmit(payload) {
     addMouvement(payload);
-    setQuantite("");
+    setCartonsSaisis("");
+    setUnitesSaisies("");
     setReference("");
     setPending(null);
   }
@@ -663,10 +681,6 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
 
           <div className="kx-card-meta">
             <div>
-              <span>Fournisseur</span>
-              <strong>{art.fournisseur}</strong>
-            </div>
-            <div>
               <span>Conditionnement</span>
               <strong>
                 {art.contenance} · colis de {art.colisage}
@@ -691,35 +705,30 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
                   <option value="sortie">Sortie</option>
                 </select>
               </label>
+              <label>
+                Cartons
+                <input type="number" min="0" step="0.001" value={cartonsSaisis} onChange={(e) => setCartonsSaisis(e.target.value)} placeholder="0" />
+              </label>
               {peutSaisirEnUnite && (
                 <label>
-                  Saisie en
-                  <select value={uniteSaisie} onChange={(e) => setUniteSaisie(e.target.value)}>
-                    <option value="carton">Cartons</option>
-                    <option value="unite">Unités</option>
-                  </select>
+                  Unités (colis de {colisage})
+                  <input type="number" min="0" step="1" value={unitesSaisies} onChange={(e) => setUnitesSaisies(e.target.value)} placeholder="0" />
                 </label>
               )}
-              <label>
-                Quantité {uniteSaisie === "unite" ? "(unités)" : "(cartons)"}
-                <input
-                  type="number"
-                  min={uniteSaisie === "unite" ? "1" : "0.001"}
-                  step={uniteSaisie === "unite" ? "1" : "0.001"}
-                  value={quantite}
-                  onChange={(e) => setQuantite(e.target.value)}
-                  required
-                />
-              </label>
               <label>
                 Date
                 <input type="date" value={date} max={todayISO()} onChange={(e) => setDate(e.target.value)} required />
               </label>
             </div>
-            {uniteSaisie === "unite" && quantiteEnCartons !== null && (
+            {unitesVal > 0 && (
               <p className="kx-conversion-hint">
-                {quantite} unité(s) sur un colis de {colisage} = <strong>{fmtQty(quantiteEnCartons)} carton(s)</strong> — c'est cette valeur qui sera
-                enregistrée.
+                {unitesVal} unité(s) sur un colis de {colisage}
+                {cartonsEntiersExtraits > 0
+                  ? <> = {cartonsEntiersExtraits} carton(s) entier(s) + {unitesRestantes} unité(s) restante(s)</>
+                  : null}{" "}
+                → <strong>{fmtQty(unitesConverties)} carton(s)</strong>
+                {cartonsVal > 0 && <> (soit {fmtQty(quantiteTotale)} carton(s) au total avec les {fmtQty(cartonsVal)} carton(s) saisis)</>} — c'est
+                cette valeur qui sera enregistrée.
               </p>
             )}
             <div className="kx-form-row">
@@ -1144,6 +1153,9 @@ export function Style() {
       .kx-list-more { font-size:11px; color:#9A927F; margin:6px 0 0; }
       .kx-commande-btn { width:100%; margin-top:14px; }
       .kx-commande-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+      .kx-commande-entete { display:flex; align-items:baseline; justify-content:space-between; border-bottom:2px solid #1B2430; padding-bottom:10px; margin-bottom:18px; }
+      .kx-commande-entete-magasin { font-family:'Spectral',serif; font-weight:700; font-size:18px; }
+      .kx-commande-entete-date { font-family:'IBM Plex Mono',monospace; font-size:13px; color:#5B5342; }
       .kx-commande-actions { display:flex; gap:10px; flex-shrink:0; }
       .kx-warning-inline { background:#FBF3E1; border:1px solid #E0C48C; color:#7A5A18; padding:10px 14px; border-radius:6px; font-size:12.5px; margin-bottom:16px; }
       .kx-filters button.kx-btn-ghost.active { background:#2F6F62; color:#fff; border-color:#2F6F62; }
