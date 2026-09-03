@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, Fragment } from "react";
 import { CATALOGUE_RAW } from "./data/catalogue.js";
 import { supabase } from "./supabaseClient.js";
 import * as XLSX from "xlsx";
@@ -78,8 +78,20 @@ function monthsAgoISO(n) {
   return d.toISOString().slice(0, 10);
 }
 
-const MOTIFS_ENTREE = ["Livraison Dépôt Zone 4", "Réception fournisseur", "Retour client", "Correction inventaire", "Autre"];
-const MOTIFS_SORTIE = ["Vente", "Défaut/Casse", "Retour Dépôt Zone 4", "Correction inventaire", "Autre"];
+const MOTIFS_ENTREE = ["Livraison Dépôt Zone 4", "Réception fournisseur", "Retour client", "Autre"];
+const MOTIFS_SORTIE = ["Vente", "Défaut/Casse", "Retour Dépôt Zone 4", "Autre"];
+const MOTIFS_INVENTAIRE = ["Inventaire physique", "Autre"];
+
+function MvtPill({ type }) {
+  const map = { entree: ["in", "Entrée"], sortie: ["out", "Sortie"], inventaire: ["inv", "Inventaire"] };
+  const [cls, label] = map[type] || ["", type];
+  return <span className={"kx-pill " + cls}>{label}</span>;
+}
+
+function fmtQteMouvement(m) {
+  if (m.type === "inventaire") return "→ " + fmtQty(m.quantite);
+  return (m.type === "entree" ? "+" : "−") + fmtQty(m.quantite);
+}
 
 function rowToMouvement(row) {
   return {
@@ -182,9 +194,14 @@ export default function KardexApp({ profile, onLogout }) {
 
   const stockByCode = useMemo(() => {
     const map = {};
-    for (const m of mouvements) {
-      const delta = m.type === "entree" ? m.quantite : -m.quantite;
-      map[m.article] = (map[m.article] || 0) + delta;
+    const chrono = [...mouvements].sort((a, b) =>
+      a.date !== b.date ? a.date.localeCompare(b.date) : String(a.createdAt).localeCompare(String(b.createdAt))
+    );
+    for (const m of chrono) {
+      const cur = map[m.article] || 0;
+      if (m.type === "entree") map[m.article] = cur + m.quantite;
+      else if (m.type === "sortie") map[m.article] = cur - m.quantite;
+      else if (m.type === "inventaire") map[m.article] = m.quantite;
     }
     return map;
   }, [mouvements]);
@@ -276,6 +293,7 @@ export default function KardexApp({ profile, onLogout }) {
             }}
           />
         )}
+        {view === "grandlivre" && <GrandLivreView mouvements={mouvements} magasinNom={(profile && profile.magasin_nom) || "Mon Magasin"} />}
       </main>
     </div>
   );
@@ -286,6 +304,7 @@ function Sidebar({ view, setView, saveState, profile, onLogout }) {
     { id: "dashboard", label: "Tableau de bord", icon: "◧" },
     { id: "kardex", label: "Kardex", icon: "▤" },
     { id: "catalogue", label: "Catalogue", icon: "▦" },
+    { id: "grandlivre", label: "Grand livre", icon: "▥" },
   ];
   const magasinNom = (profile && profile.magasin_nom) || "Mon Magasin";
   const photoUrl = profile && profile.photo_url;
@@ -390,7 +409,7 @@ function Dashboard({ valeurStock, suiviCodes, ruptures, stockFaible, articlesAct
                       <td>{fmtDate(m.date)}</td>
                       <td>{art ? art.designation : m.article}</td>
                       <td>
-                        <span className={"kx-pill " + (m.type === "entree" ? "in" : "out")}>{m.type === "entree" ? "Entrée" : "Sortie"}</span>
+                        <MvtPill type={m.type} />
                       </td>
                       <td className="num">{fmtQty(m.quantite)}</td>
                     </tr>
@@ -520,6 +539,284 @@ function CommandeView({ ruptures, objectifsByCode, stockByCode, magasinNom, onBa
   );
 }
 
+// Calcule, pour un article et une période donnée, le stock initial, les entrées, sorties,
+// l'ajustement net des inventaires, le stock final, et le détail des mouvements de la période
+// (en tenant compte de la totalité de l'historique, pas seulement de la période affichée).
+function calculerRapportArticle(code, allMouvements, dateDebut, dateFin) {
+  const mvts = allMouvements
+    .filter((m) => m.article === code)
+    .sort((a, b) => (a.date !== b.date ? a.date.localeCompare(b.date) : String(a.createdAt).localeCompare(String(b.createdAt))));
+
+  let stock = 0;
+  let stockInitial = 0;
+  let entrees = 0;
+  let sorties = 0;
+  let ajustements = 0;
+  let initialCapture = false;
+  const detail = [];
+
+  for (const m of mvts) {
+    if (m.date < dateDebut) {
+      if (m.type === "entree") stock += m.quantite;
+      else if (m.type === "sortie") stock -= m.quantite;
+      else if (m.type === "inventaire") stock = m.quantite;
+    } else if (m.date <= dateFin) {
+      if (!initialCapture) {
+        stockInitial = stock;
+        initialCapture = true;
+      }
+      if (m.type === "entree") {
+        entrees += m.quantite;
+        stock += m.quantite;
+      } else if (m.type === "sortie") {
+        sorties += m.quantite;
+        stock -= m.quantite;
+      } else if (m.type === "inventaire") {
+        ajustements += m.quantite - stock;
+        stock = m.quantite;
+      }
+      detail.push({ ...m, solde: stock });
+    }
+  }
+  if (!initialCapture) stockInitial = stock;
+
+  return {
+    code,
+    art: ARTICLES_BY_CODE[code],
+    stockInitial,
+    entrees,
+    sorties,
+    ajustements,
+    stockFinal: stock,
+    detail: [...detail].sort(compareMvtDesc),
+  };
+}
+
+function MultiArticleSelect({ selected, setSelected }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+
+  const results = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    return ARTICLES.filter((a) => !selected.includes(a.code) && (a.designation.toLowerCase().includes(q) || String(a.code).includes(q))).slice(0, 8);
+  }, [query, selected]);
+
+  useEffect(() => {
+    function onClick(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  return (
+    <div className="kx-multiselect" ref={wrapRef}>
+      <div className="kx-multiselect-chips">
+        {selected.map((code) => {
+          const a = ARTICLES_BY_CODE[code];
+          if (!a) return null;
+          return (
+            <span key={code} className="kx-chip">
+              {a.designation}
+              <button type="button" onClick={() => setSelected(selected.filter((c) => c !== code))}>
+                ×
+              </button>
+            </span>
+          );
+        })}
+        <input
+          type="text"
+          placeholder={selected.length ? "Ajouter un autre article…" : "Rechercher un ou plusieurs articles…"}
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+        />
+      </div>
+      {open && results.length > 0 && (
+        <div className="kx-autocomplete-list">
+          {results.map((a) => (
+            <div
+              key={a.code}
+              className="kx-autocomplete-item"
+              onClick={() => {
+                setSelected([...selected, a.code]);
+                setQuery("");
+              }}
+            >
+              <span className="kx-tab" style={{ background: catMeta(a.categorie).color }} />
+              <div>
+                <div className="ac-name">{a.designation}</div>
+                <div className="ac-meta">
+                  {a.code} · {catMeta(a.categorie).label}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GrandLivreView({ mouvements, magasinNom }) {
+  const [dateDebut, setDateDebut] = useState(monthsAgoISO(3));
+  const [dateFin, setDateFin] = useState(todayISO());
+  const [selectedCodes, setSelectedCodes] = useState([]);
+  const [expanded, setExpanded] = useState({});
+
+  const dateMin = monthsAgoISO(24);
+
+  const rapports = useMemo(
+    () => selectedCodes.map((code) => calculerRapportArticle(code, mouvements, dateDebut, dateFin)).filter((r) => r.art),
+    [selectedCodes, mouvements, dateDebut, dateFin]
+  );
+
+  const totaux = useMemo(() => {
+    return rapports.reduce(
+      (acc, r) => {
+        acc.valeurInitiale += r.stockInitial * r.art.prixCarton;
+        acc.valeurFinale += r.stockFinal * r.art.prixCarton;
+        return acc;
+      },
+      { valeurInitiale: 0, valeurFinale: 0 }
+    );
+  }, [rapports]);
+
+  function toggleExpanded(code) {
+    setExpanded((prev) => ({ ...prev, [code]: !prev[code] }));
+  }
+
+  return (
+    <div>
+      <header className="kx-page-header">
+        <h1>Grand livre</h1>
+        <p>Stock initial, entrées, sorties et stock final par article, sur une période choisie (jusqu'à 2 ans).</p>
+      </header>
+
+      <div className="kx-filters">
+        <label className="kx-inline-label">
+          Du
+          <input type="date" value={dateDebut} min={dateMin} max={dateFin} onChange={(e) => setDateDebut(e.target.value)} />
+        </label>
+        <label className="kx-inline-label">
+          Au
+          <input type="date" value={dateFin} min={dateDebut} max={todayISO()} onChange={(e) => setDateFin(e.target.value)} />
+        </label>
+      </div>
+
+      <MultiArticleSelect selected={selectedCodes} setSelected={setSelectedCodes} />
+
+      {selectedCodes.length === 0 ? (
+        <p className="kx-empty" style={{ marginTop: 20 }}>
+          Sélectionne un ou plusieurs articles ci-dessus pour générer le rapport.
+        </p>
+      ) : (
+        <>
+          <div className="kx-glivre-header">
+            <div>
+              <span>Magasin</span>
+              <strong>{magasinNom}</strong>
+            </div>
+            <div>
+              <span>Période</span>
+              <strong>
+                {fmtDate(dateDebut)} → {fmtDate(dateFin)}
+              </strong>
+            </div>
+            <div>
+              <span>Valeur du stock au début</span>
+              <strong>{fmtFCFA(totaux.valeurInitiale)}</strong>
+            </div>
+            <div>
+              <span>Valeur du stock à la fin</span>
+              <strong>{fmtFCFA(totaux.valeurFinale)}</strong>
+            </div>
+          </div>
+
+          <table className="kx-table kx-table-cat" style={{ marginTop: 16 }}>
+            <thead>
+              <tr>
+                <th>Code</th>
+                <th>Désignation</th>
+                <th className="num">Stock initial</th>
+                <th className="num">Entrées</th>
+                <th className="num">Sorties</th>
+                <th className="num">Inventaires</th>
+                <th className="num">Stock final</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rapports.map((r) => (
+                <Fragment key={r.code}>
+                  <tr>
+                    <td className="mono">{r.code}</td>
+                    <td>{r.art.designation}</td>
+                    <td className="num">{fmtQty(r.stockInitial)}</td>
+                    <td className="num">{fmtQty(r.entrees)}</td>
+                    <td className="num">{fmtQty(r.sorties)}</td>
+                    <td className="num">
+                      {r.ajustements > 0 ? "+" : r.ajustements < 0 ? "−" : ""}
+                      {fmtQty(Math.abs(r.ajustements))}
+                    </td>
+                    <td className="num strong">{fmtQty(r.stockFinal)}</td>
+                    <td>
+                      <button type="button" className="kx-btn-ghost kx-btn-small" onClick={() => toggleExpanded(r.code)}>
+                        {expanded[r.code] ? "Masquer" : "Détails"}
+                      </button>
+                    </td>
+                  </tr>
+                  {expanded[r.code] && (
+                    <tr>
+                      <td colSpan={8} className="kx-detail-cell">
+                        {r.detail.length === 0 ? (
+                          <p className="kx-empty">Aucun mouvement sur la période pour cet article.</p>
+                        ) : (
+                          <table className="kx-table">
+                            <thead>
+                              <tr>
+                                <th>Date</th>
+                                <th>Type</th>
+                                <th>Motif</th>
+                                <th>Référence</th>
+                                <th className="num">Qté</th>
+                                <th className="num">Solde</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {r.detail.map((m) => (
+                                <tr key={m.id}>
+                                  <td>{fmtDate(m.date)}</td>
+                                  <td>
+                                    <MvtPill type={m.type} />
+                                  </td>
+                                  <td>{m.motif}</td>
+                                  <td>{m.reference || "—"}</td>
+                                  <td className="num">{fmtQteMouvement(m)}</td>
+                                  <td className="num strong">{fmtQty(m.solde)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </div>
+  );
+}
+
 function ArticleAutocomplete({ onSelect }) {
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
@@ -583,17 +880,19 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
   const [type, setType] = useState("entree");
   const [cartonsSaisis, setCartonsSaisis] = useState("");
   const [unitesSaisies, setUnitesSaisies] = useState("");
+  const [inventaireValeur, setInventaireValeur] = useState("");
   const [date, setDate] = useState(todayISO());
   const [motif, setMotif] = useState(MOTIFS_ENTREE[0]);
   const [reference, setReference] = useState("");
 
   useEffect(() => {
-    setMotif(type === "entree" ? MOTIFS_ENTREE[0] : MOTIFS_SORTIE[0]);
+    setMotif(type === "entree" ? MOTIFS_ENTREE[0] : type === "sortie" ? MOTIFS_SORTIE[0] : MOTIFS_INVENTAIRE[0]);
   }, [type]);
 
   useEffect(() => {
     setCartonsSaisis("");
     setUnitesSaisies("");
+    setInventaireValeur("");
   }, [selectedCode]);
 
   const [pending, setPending] = useState(null);
@@ -612,7 +911,9 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
 
   let running = 0;
   const historiqueAvecSolde = historique.map((m) => {
-    running += m.type === "entree" ? m.quantite : -m.quantite;
+    if (m.type === "entree") running += m.quantite;
+    else if (m.type === "sortie") running -= m.quantite;
+    else if (m.type === "inventaire") running = m.quantite;
     return { ...m, solde: running };
   });
   // Le plus récent en premier (date, puis heure de saisie pour les mouvements du même jour)
@@ -629,20 +930,32 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
   const quantiteTotale = Math.round((cartonsVal + unitesConverties) * 1000) / 1000;
   const quantiteEnCartons = quantiteTotale > 0 ? quantiteTotale : null;
 
+  const stockActuel = art ? stockByCode[art.code] || 0 : 0;
+
   function doSubmit(payload) {
     addMouvement(payload);
     setCartonsSaisis("");
     setUnitesSaisies("");
+    setInventaireValeur("");
     setReference("");
     setPending(null);
   }
 
   function submit(e) {
     e.preventDefault();
-    if (!art || quantiteEnCartons === null || !date) return;
+    if (!art || !date) return;
+
+    if (type === "inventaire") {
+      const q = parseFloat(inventaireValeur);
+      if (isNaN(q) || q < 0) return;
+      const payload = { article: art.code, type, quantite: Math.round(q * 1000) / 1000, date, motif, reference: reference.trim() };
+      setPending(payload); // un inventaire demande toujours confirmation
+      return;
+    }
+
+    if (quantiteEnCartons === null) return;
     const payload = { article: art.code, type, quantite: quantiteEnCartons, date, motif, reference: reference.trim() };
-    const dispo = stockByCode[art.code] || 0;
-    if (type === "sortie" && quantiteEnCartons > dispo) {
+    if (type === "sortie" && quantiteEnCartons > stockActuel) {
       setPending(payload);
       return;
     }
@@ -703,16 +1016,35 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
                 <select value={type} onChange={(e) => setType(e.target.value)}>
                   <option value="entree">Entrée</option>
                   <option value="sortie">Sortie</option>
+                  <option value="inventaire">Inventaire</option>
                 </select>
               </label>
-              <label>
-                Cartons
-                <input type="number" min="0" step="0.001" value={cartonsSaisis} onChange={(e) => setCartonsSaisis(e.target.value)} placeholder="0" />
-              </label>
-              {peutSaisirEnUnite && (
+              {type !== "inventaire" && (
+                <>
+                  <label>
+                    Cartons
+                    <input type="number" min="0" step="0.001" value={cartonsSaisis} onChange={(e) => setCartonsSaisis(e.target.value)} placeholder="0" />
+                  </label>
+                  {peutSaisirEnUnite && (
+                    <label>
+                      Unités (colis de {colisage})
+                      <input type="number" min="0" step="1" value={unitesSaisies} onChange={(e) => setUnitesSaisies(e.target.value)} placeholder="0" />
+                    </label>
+                  )}
+                </>
+              )}
+              {type === "inventaire" && (
                 <label>
-                  Unités (colis de {colisage})
-                  <input type="number" min="0" step="1" value={unitesSaisies} onChange={(e) => setUnitesSaisies(e.target.value)} placeholder="0" />
+                  Nouveau stock (cartons) — actuel : {fmtQty(stockActuel)}
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.001"
+                    value={inventaireValeur}
+                    onChange={(e) => setInventaireValeur(e.target.value)}
+                    placeholder="0"
+                    required
+                  />
                 </label>
               )}
               <label>
@@ -735,7 +1067,7 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
               <label>
                 Motif
                 <select value={motif} onChange={(e) => setMotif(e.target.value)}>
-                  {(type === "entree" ? MOTIFS_ENTREE : MOTIFS_SORTIE).map((m) => (
+                  {(type === "entree" ? MOTIFS_ENTREE : type === "sortie" ? MOTIFS_SORTIE : MOTIFS_INVENTAIRE).map((m) => (
                     <option key={m}>{m}</option>
                   ))}
                 </select>
@@ -744,14 +1076,31 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
                 Référence (n° BL, facture…)
                 <input type="text" value={reference} onChange={(e) => setReference(e.target.value)} placeholder="Optionnel" />
               </label>
-              <button type="submit" className={"kx-btn " + (type === "entree" ? "btn-in" : "btn-out")}>
-                Enregistrer {type === "entree" ? "l'entrée" : "la sortie"}
+              <button type="submit" className={"kx-btn " + (type === "entree" ? "btn-in" : type === "sortie" ? "btn-out" : "btn-inv")}>
+                {type === "entree" ? "Enregistrer l'entrée" : type === "sortie" ? "Enregistrer la sortie" : "Enregistrer l'inventaire"}
               </button>
             </div>
-            {pending && (
+            {pending && pending.type === "inventaire" && (
               <div className="kx-warning">
                 <p>
-                  La quantité saisie ({fmtQty(pending.quantite)} carton(s)) est supérieure au stock disponible ({fmtQty(stockByCode[art.code] || 0)} carton(s)).
+                  Tu es sur le point de <strong>remplacer</strong> le stock actuel de {art.designation} — actuellement{" "}
+                  <strong>{fmtQty(stockActuel)} carton(s)</strong> — par <strong>{fmtQty(pending.quantite)} carton(s)</strong>. Cette action sera
+                  enregistrée comme un ajustement d'inventaire dans l'historique. Confirmer l'enregistrement ?
+                </p>
+                <div className="kx-warning-actions">
+                  <button type="button" className="kx-btn btn-inv" onClick={() => doSubmit(pending)}>
+                    Confirmer l'inventaire
+                  </button>
+                  <button type="button" className="kx-btn-ghost" onClick={() => setPending(null)}>
+                    Annuler
+                  </button>
+                </div>
+              </div>
+            )}
+            {pending && pending.type === "sortie" && (
+              <div className="kx-warning">
+                <p>
+                  La quantité saisie ({fmtQty(pending.quantite)} carton(s)) est supérieure au stock disponible ({fmtQty(stockActuel)} carton(s)).
                   Voulez-vous poursuivre quand même ?
                 </p>
                 <div className="kx-warning-actions">
@@ -787,14 +1136,11 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
                     <tr key={m.id}>
                       <td>{fmtDate(m.date)}</td>
                       <td>
-                        <span className={"kx-pill " + (m.type === "entree" ? "in" : "out")}>{m.type === "entree" ? "Entrée" : "Sortie"}</span>
+                        <MvtPill type={m.type} />
                       </td>
                       <td>{m.motif}</td>
                       <td>{m.reference || "—"}</td>
-                      <td className="num">
-                        {m.type === "entree" ? "+" : "−"}
-                        {fmtQty(m.quantite)}
-                      </td>
+                      <td className="num">{fmtQteMouvement(m)}</td>
                       <td className="num strong">{fmtQty(m.solde)}</td>
                     </tr>
                   ))}
@@ -1070,6 +1416,8 @@ export function Style() {
       .kx-pill { font-size:10.5px; padding:2px 8px; border-radius:10px; font-weight:600; }
       .kx-pill.in { background:#E1EEE9; color:#2F6F62; }
       .kx-pill.out { background:#F3E1DC; color:#A6432A; }
+      .kx-pill.inv { background:#EDE1F3; color:#6E4A9E; }
+      .btn-inv { background:#6E4A9E; }
 
       .kx-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px; }
       .kx-list li { display:flex; align-items:center; gap:8px; padding:9px 6px; font-size:12.5px; border-bottom:1px solid #E7E2D4; }
@@ -1163,6 +1511,18 @@ export function Style() {
       .kx-filters-advanced label { display:flex; flex-direction:column; gap:5px; font-size:11px; color:#7A7264; }
       .kx-filters-advanced select, .kx-filters-advanced input { padding:8px 10px; border:1px solid #CFC8B2; border-radius:6px; font-size:12.5px; font-family:inherit; background:#fff; min-width:120px; }
       .kx-filters-advanced input[type=number] { min-width:90px; }
+      .kx-inline-label { display:flex; flex-direction:column; gap:5px; font-size:11px; color:#7A7264; }
+      .kx-inline-label input { padding:8px 10px; border:1px solid #CFC8B2; border-radius:6px; font-size:12.5px; font-family:inherit; background:#F7F5EE; }
+      .kx-multiselect { position:relative; max-width:560px; margin-bottom:16px; }
+      .kx-multiselect-chips { display:flex; flex-wrap:wrap; gap:6px; align-items:center; border:1px solid #CFC8B2; border-radius:6px; background:#F7F5EE; padding:6px 8px; min-height:20px; }
+      .kx-multiselect-chips input { border:none; background:transparent; outline:none; font-size:12.5px; font-family:inherit; flex:1; min-width:160px; padding:4px; }
+      .kx-chip { display:inline-flex; align-items:center; gap:6px; background:#2F6F62; color:#fff; font-size:11.5px; padding:4px 6px 4px 10px; border-radius:12px; }
+      .kx-chip button { background:none; border:none; color:#fff; cursor:pointer; font-size:14px; line-height:1; padding:0 2px; }
+      .kx-glivre-header { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; background:#F7F5EE; border:1px solid #DCD6C4; border-radius:8px; padding:14px 16px; }
+      .kx-glivre-header span { display:block; font-size:10.5px; text-transform:uppercase; color:#9A927F; margin-bottom:3px; }
+      .kx-glivre-header strong { font-size:13.5px; }
+      .kx-btn-small { padding:6px 12px; font-size:11.5px; }
+      .kx-detail-cell { background:#F0ECDD; padding:12px 20px !important; }
       @media print {
         .kx-sidebar, .kx-commande-actions { display:none !important; }
         .kx-main { max-height:none !important; overflow:visible !important; }
