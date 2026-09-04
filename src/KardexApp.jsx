@@ -880,7 +880,6 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
   const [type, setType] = useState("entree");
   const [cartonsSaisis, setCartonsSaisis] = useState("");
   const [unitesSaisies, setUnitesSaisies] = useState("");
-  const [inventaireValeur, setInventaireValeur] = useState("");
   const [date, setDate] = useState(todayISO());
   const [motif, setMotif] = useState(MOTIFS_ENTREE[0]);
   const [reference, setReference] = useState("");
@@ -892,7 +891,6 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
   useEffect(() => {
     setCartonsSaisis("");
     setUnitesSaisies("");
-    setInventaireValeur("");
   }, [selectedCode]);
 
   const [pending, setPending] = useState(null);
@@ -936,25 +934,19 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
     addMouvement(payload);
     setCartonsSaisis("");
     setUnitesSaisies("");
-    setInventaireValeur("");
     setReference("");
     setPending(null);
   }
 
   function submit(e) {
     e.preventDefault();
-    if (!art || !date) return;
+    if (!art || !date || quantiteEnCartons === null) return;
+    const payload = { article: art.code, type, quantite: quantiteEnCartons, date, motif, reference: reference.trim() };
 
     if (type === "inventaire") {
-      const q = parseFloat(inventaireValeur);
-      if (isNaN(q) || q < 0) return;
-      const payload = { article: art.code, type, quantite: Math.round(q * 1000) / 1000, date, motif, reference: reference.trim() };
-      setPending(payload); // un inventaire demande toujours confirmation
+      setPending(payload); // un inventaire demande toujours confirmation, car il écrase le stock
       return;
     }
-
-    if (quantiteEnCartons === null) return;
-    const payload = { article: art.code, type, quantite: quantiteEnCartons, date, motif, reference: reference.trim() };
     if (type === "sortie" && quantiteEnCartons > stockActuel) {
       setPending(payload);
       return;
@@ -1019,32 +1011,14 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
                   <option value="inventaire">Inventaire</option>
                 </select>
               </label>
-              {type !== "inventaire" && (
-                <>
-                  <label>
-                    Cartons
-                    <input type="number" min="0" step="0.001" value={cartonsSaisis} onChange={(e) => setCartonsSaisis(e.target.value)} placeholder="0" />
-                  </label>
-                  {peutSaisirEnUnite && (
-                    <label>
-                      Unités (colis de {colisage})
-                      <input type="number" min="0" step="1" value={unitesSaisies} onChange={(e) => setUnitesSaisies(e.target.value)} placeholder="0" />
-                    </label>
-                  )}
-                </>
-              )}
-              {type === "inventaire" && (
+              <label>
+                Cartons
+                <input type="number" min="0" step="0.001" value={cartonsSaisis} onChange={(e) => setCartonsSaisis(e.target.value)} placeholder="0" />
+              </label>
+              {peutSaisirEnUnite && (
                 <label>
-                  Nouveau stock (cartons) — actuel : {fmtQty(stockActuel)}
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.001"
-                    value={inventaireValeur}
-                    onChange={(e) => setInventaireValeur(e.target.value)}
-                    placeholder="0"
-                    required
-                  />
+                  Unités (colis de {colisage})
+                  <input type="number" min="0" step="1" value={unitesSaisies} onChange={(e) => setUnitesSaisies(e.target.value)} placeholder="0" />
                 </label>
               )}
               <label>
@@ -1052,6 +1026,9 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
                 <input type="date" value={date} max={todayISO()} onChange={(e) => setDate(e.target.value)} required />
               </label>
             </div>
+            {type === "inventaire" && (
+              <p className="kx-conversion-hint">Stock actuel de cet article : <strong>{fmtQty(stockActuel)} carton(s)</strong>.</p>
+            )}
             {unitesVal > 0 && (
               <p className="kx-conversion-hint">
                 {unitesVal} unité(s) sur un colis de {colisage}
