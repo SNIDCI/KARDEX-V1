@@ -83,9 +83,13 @@ const MOTIFS_SORTIE = ["Vente", "Défaut/Casse", "Retour Dépôt Zone 4", "Autre
 const MOTIFS_INVENTAIRE = ["Inventaire physique", "Autre"];
 
 function MvtPill({ type }) {
-  const map = { entree: ["in", "Entrée"], sortie: ["out", "Sortie"], inventaire: ["inv", "Inventaire"] };
+  const map = { entree: ["in", "Entrée"], sortie: ["out", "Sortie"], inventaire: ["inv", "⟳ INVENTAIRE"] };
   const [cls, label] = map[type] || ["", type];
   return <span className={"kx-pill " + cls}>{label}</span>;
+}
+
+function mvtRowClass(m, base) {
+  return (base ? base + " " : "") + (m.type === "inventaire" ? "kx-row-inventaire" : "");
 }
 
 function fmtQteMouvement(m) {
@@ -217,12 +221,13 @@ export default function KardexApp({ profile, onLogout }) {
   }, [suiviCodes, stockByCode]);
 
   const ruptures = suiviCodes.filter((c) => (stockByCode[c] || 0) <= 0);
-  const stockFaible = useMemo(() => {
+  const rupturesAvecObjectif = suiviCodes.filter((c) => (objectifsByCode[c] || 0) > 0 && (stockByCode[c] || 0) <= 0);
+  // "Stock faible" = uniquement les articles avec une Qté voulue définie, en stock (>0) mais sous cette qté voulue.
+  const articlesACommander = useMemo(() => {
     return suiviCodes.filter((c) => {
       const stock = stockByCode[c] || 0;
-      if (stock <= 0) return false;
       const objectif = objectifsByCode[c] || 0;
-      return objectif > 0 ? stock < objectif : stock <= 5;
+      return objectif > 0 && stock > 0 && stock < objectif;
     });
   }, [suiviCodes, stockByCode, objectifsByCode]);
 
@@ -252,7 +257,8 @@ export default function KardexApp({ profile, onLogout }) {
             valeurStock={valeurStock}
             suiviCodes={suiviCodes}
             ruptures={ruptures}
-            stockFaible={stockFaible}
+            rupturesAvecObjectif={rupturesAvecObjectif}
+            articlesACommander={articlesACommander}
             articlesActifs6Mois={articlesActifs6Mois}
             objectifsByCode={objectifsByCode}
             stockByCode={stockByCode}
@@ -262,15 +268,28 @@ export default function KardexApp({ profile, onLogout }) {
               setView("kardex");
             }}
             onOpenCommande={() => setView("commande")}
+            onOpenRuptures={() => setView("ruptures")}
           />
         )}
         {view === "commande" && (
           <CommandeView
-            ruptures={ruptures}
+            articles={articlesACommander}
             objectifsByCode={objectifsByCode}
             stockByCode={stockByCode}
             magasinNom={(profile && profile.magasin_nom) || "Mon Magasin"}
             onBack={() => setView("dashboard")}
+          />
+        )}
+        {view === "ruptures" && (
+          <RupturesView
+            ruptures={ruptures}
+            objectifsByCode={objectifsByCode}
+            stockByCode={stockByCode}
+            onBack={() => setView("dashboard")}
+            onOpenArticle={(code) => {
+              setSelectedCode(code);
+              setView("kardex");
+            }}
           />
         )}
         {view === "kardex" && (
@@ -347,9 +366,14 @@ function Sidebar({ view, setView, saveState, profile, onLogout }) {
   );
 }
 
-function StatCard({ label, value, hint, tone, title }) {
+function StatCard({ label, value, hint, tone, title, onClick }) {
   return (
-    <div className={"kx-stat" + (tone ? " tone-" + tone : "")} title={title}>
+    <div
+      className={"kx-stat" + (tone ? " tone-" + tone : "") + (onClick ? " clickable" : "")}
+      title={title}
+      onClick={onClick}
+      role={onClick ? "button" : undefined}
+    >
       <div className="kx-stat-label">{label}</div>
       <div className="kx-stat-value">{value}</div>
       {hint && <div className="kx-stat-hint">{hint}</div>}
@@ -357,7 +381,18 @@ function StatCard({ label, value, hint, tone, title }) {
   );
 }
 
-function Dashboard({ valeurStock, suiviCodes, ruptures, stockFaible, articlesActifs6Mois, mouvementsRecents, onOpenArticle, onOpenCommande }) {
+function Dashboard({
+  valeurStock,
+  suiviCodes,
+  ruptures,
+  rupturesAvecObjectif,
+  articlesACommander,
+  articlesActifs6Mois,
+  mouvementsRecents,
+  onOpenArticle,
+  onOpenCommande,
+  onOpenRuptures,
+}) {
   return (
     <div>
       <header className="kx-page-header">
@@ -372,12 +407,20 @@ function Dashboard({ valeurStock, suiviCodes, ruptures, stockFaible, articlesAct
           hint={suiviCodes.length + " article(s) avec mouvements"}
           title="Somme, pour chaque article ayant déjà eu un mouvement, de (stock actuel × prix carton). Les articles jamais mouvementés ne sont pas comptés."
         />
-        <StatCard label="Ruptures de stock" value={ruptures.length} hint="stock ≤ 0" tone={ruptures.length ? "warn" : ""} />
+        <StatCard
+          label="Ruptures de stock"
+          value={rupturesAvecObjectif.length}
+          hint={ruptures.length + " au total (toutes Qté voulue confondues)"}
+          tone={rupturesAvecObjectif.length ? "warn" : ""}
+          title="Stock ≤ 0. Le grand nombre ne compte que les articles avec une Qté voulue définie ; le total en dessous inclut tous les articles suivis."
+          onClick={onOpenRuptures}
+        />
         <StatCard
           label="Stock faible"
-          value={stockFaible.length}
-          hint="sous la Qté voulue (ou ≤ 5 si non définie)"
-          tone={stockFaible.length ? "amber" : ""}
+          value={articlesACommander.length}
+          hint="Qté voulue définie, stock sous cette Qté voulue"
+          tone={articlesACommander.length ? "amber" : ""}
+          onClick={onOpenCommande}
         />
         <StatCard
           label="Articles actifs (6 mois)"
@@ -405,7 +448,11 @@ function Dashboard({ valeurStock, suiviCodes, ruptures, stockFaible, articlesAct
                 {mouvementsRecents.map((m) => {
                   const art = ARTICLES_BY_CODE[m.article];
                   return (
-                    <tr key={m.id} onClick={() => onOpenArticle(m.article)} className="clickable">
+                    <tr
+                      key={m.id}
+                      onClick={() => onOpenArticle(m.article)}
+                      className={"clickable" + (m.type === "inventaire" ? " kx-row-inventaire" : "")}
+                    >
                       <td>{fmtDate(m.date)}</td>
                       <td>{art ? art.designation : m.article}</td>
                       <td>
@@ -421,13 +468,13 @@ function Dashboard({ valeurStock, suiviCodes, ruptures, stockFaible, articlesAct
         </div>
 
         <div className="kx-panel">
-          <h2>Articles en rupture</h2>
-          {ruptures.length === 0 ? (
-            <p className="kx-empty">Aucune rupture parmi les articles suivis.</p>
+          <h2>Articles à commander</h2>
+          {articlesACommander.length === 0 ? (
+            <p className="kx-empty">Aucun article sous sa Qté voulue pour l'instant.</p>
           ) : (
             <>
               <ul className="kx-list">
-                {ruptures.slice(0, 8).map((code) => {
+                {articlesACommander.slice(0, 8).map((code) => {
                   const art = ARTICLES_BY_CODE[code];
                   if (!art) return null;
                   return (
@@ -439,9 +486,9 @@ function Dashboard({ valeurStock, suiviCodes, ruptures, stockFaible, articlesAct
                   );
                 })}
               </ul>
-              {ruptures.length > 8 && <p className="kx-list-more">+ {ruptures.length - 8} autre(s) article(s) en rupture</p>}
+              {articlesACommander.length > 8 && <p className="kx-list-more">+ {articlesACommander.length - 8} autre(s) article(s) à commander</p>}
               <button className="kx-btn-ghost kx-commande-btn" onClick={onOpenCommande}>
-                Générer la fiche de commande ({ruptures.length})
+                Voir la fiche de commande ({articlesACommander.length})
               </button>
             </>
           )}
@@ -451,33 +498,35 @@ function Dashboard({ valeurStock, suiviCodes, ruptures, stockFaible, articlesAct
   );
 }
 
-function CommandeView({ ruptures, objectifsByCode, stockByCode, magasinNom, onBack }) {
+function CommandeView({ articles, objectifsByCode, stockByCode, magasinNom, onBack }) {
+  const [q, setQ] = useState("");
+
   const lignes = useMemo(() => {
-    return ruptures
+    return articles
       .map((code) => ARTICLES_BY_CODE[code])
       .filter(Boolean)
       .map((art) => {
         const objectif = objectifsByCode[art.code] || 0;
         const stock = stockByCode[art.code] || 0;
-        return { art, stock, objectif, aCommander: objectif > 0 ? Math.max(0, Math.round((objectif - stock) * 1000) / 1000) : null };
+        const diff = Math.max(0, Math.round((objectif - stock) * 1000) / 1000);
+        // Toujours arrondi au carton entier supérieur, même pour une infime fraction.
+        const aCommanderCartons = diff > 0 ? Math.ceil(diff - 1e-9) : 0;
+        return { art, stock, objectif, aCommander: diff, aCommanderCartons };
+      })
+      .filter((l) => {
+        const query = q.trim().toLowerCase();
+        if (!query) return true;
+        return l.art.designation.toLowerCase().includes(query) || String(l.art.code).includes(query);
       })
       .sort((a, b) => a.art.designation.localeCompare(b.art.designation));
-  }, [ruptures, objectifsByCode, stockByCode]);
-
-  const sansObjectif = lignes.filter((l) => l.objectif <= 0).length;
+  }, [articles, objectifsByCode, stockByCode, q]);
 
   function telecharger() {
     const entete = [[magasinNom], [`Fiche de commande — ${fmtDate(todayISO())}`], []];
-    const colonnes = ["Code", "Désignation", "Qté actuelle", "Qté voulue", "Qté à commander"];
-    const lignesData = lignes.map((l) => [
-      l.art.code,
-      l.art.designation,
-      l.stock,
-      l.objectif > 0 ? l.objectif : "",
-      l.aCommander !== null ? l.aCommander : "",
-    ]);
+    const colonnes = ["Code", "Désignation", "Qté actuelle", "Qté voulue", "Qté à commander (réelle)", "Qté à commander (cartons entiers)"];
+    const lignesData = lignes.map((l) => [l.art.code, l.art.designation, l.stock, l.objectif, l.aCommander, l.aCommanderCartons]);
     const ws = XLSX.utils.aoa_to_sheet([...entete, colonnes, ...lignesData]);
-    ws["!cols"] = [{ wch: 10 }, { wch: 45 }, { wch: 13 }, { wch: 13 }, { wch: 16 }];
+    ws["!cols"] = [{ wch: 10 }, { wch: 45 }, { wch: 13 }, { wch: 13 }, { wch: 20 }, { wch: 22 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Commande");
     XLSX.writeFile(wb, `fiche-commande-${todayISO()}.xlsx`);
@@ -492,7 +541,7 @@ function CommandeView({ ruptures, objectifsByCode, stockByCode, magasinNom, onBa
       <header className="kx-page-header kx-commande-header">
         <div>
           <h1>Fiche de commande</h1>
-          <p>Articles en rupture — quantité à commander pour atteindre la Qté voulue.</p>
+          <p>Articles sous leur Qté voulue — quantité à commander pour l'atteindre à nouveau.</p>
         </div>
         <div className="kx-commande-actions">
           <button className="kx-btn-ghost" onClick={onBack}>
@@ -507,11 +556,10 @@ function CommandeView({ ruptures, objectifsByCode, stockByCode, magasinNom, onBa
         </div>
       </header>
 
-      {sansObjectif > 0 && (
-        <p className="kx-warning-inline">
-          {sansObjectif} article(s) n'ont pas de Qté voulue définie dans le Catalogue — la quantité à commander ne peut pas être calculée pour eux.
-        </p>
-      )}
+      <div className="kx-filters">
+        <input type="text" placeholder="Rechercher par nom ou code…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <span className="kx-filters-count">{lignes.length.toLocaleString("fr-FR")} article(s)</span>
+      </div>
 
       <table className="kx-table kx-table-cat">
         <thead>
@@ -520,7 +568,8 @@ function CommandeView({ ruptures, objectifsByCode, stockByCode, magasinNom, onBa
             <th>Désignation</th>
             <th className="num">Qté actuelle</th>
             <th className="num">Qté voulue</th>
-            <th className="num">Qté à commander</th>
+            <th className="num">Qté à commander (réelle)</th>
+            <th className="num">À commander (cartons)</th>
           </tr>
         </thead>
         <tbody>
@@ -529,10 +578,72 @@ function CommandeView({ ruptures, objectifsByCode, stockByCode, magasinNom, onBa
               <td className="mono">{l.art.code}</td>
               <td>{l.art.designation}</td>
               <td className="num">{fmtQty(l.stock)}</td>
-              <td className="num">{l.objectif > 0 ? fmtQty(l.objectif) : "—"}</td>
-              <td className="num strong">{l.aCommander !== null ? fmtQty(l.aCommander) : "—"}</td>
+              <td className="num">{fmtQty(l.objectif)}</td>
+              <td className="num">{fmtQty(l.aCommander)}</td>
+              <td className="num strong">{l.aCommanderCartons} carton(s)</td>
             </tr>
           ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RupturesView({ ruptures, objectifsByCode, stockByCode, onBack, onOpenArticle }) {
+  const [q, setQ] = useState("");
+
+  const lignes = useMemo(() => {
+    return ruptures
+      .map((code) => ARTICLES_BY_CODE[code])
+      .filter(Boolean)
+      .filter((art) => {
+        const query = q.trim().toLowerCase();
+        if (!query) return true;
+        return art.designation.toLowerCase().includes(query) || String(art.code).includes(query);
+      })
+      .sort((a, b) => a.designation.localeCompare(b.designation));
+  }, [ruptures, q]);
+
+  return (
+    <div>
+      <header className="kx-page-header kx-commande-header">
+        <div>
+          <h1>Ruptures de stock</h1>
+          <p>Tous les articles suivis dont le stock est actuellement ≤ 0.</p>
+        </div>
+        <div className="kx-commande-actions">
+          <button className="kx-btn-ghost" onClick={onBack}>
+            ← Retour au tableau de bord
+          </button>
+        </div>
+      </header>
+
+      <div className="kx-filters">
+        <input type="text" placeholder="Rechercher par nom ou code…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <span className="kx-filters-count">{lignes.length.toLocaleString("fr-FR")} article(s)</span>
+      </div>
+
+      <table className="kx-table kx-table-cat">
+        <thead>
+          <tr>
+            <th>Code</th>
+            <th>Désignation</th>
+            <th className="num">Stock actuel</th>
+            <th className="num">Qté voulue</th>
+          </tr>
+        </thead>
+        <tbody>
+          {lignes.map((art) => {
+            const objectif = objectifsByCode[art.code] || 0;
+            return (
+              <tr key={art.code} className="clickable" onClick={() => onOpenArticle(art.code)}>
+                <td className="mono">{art.code}</td>
+                <td>{art.designation}</td>
+                <td className="num">{fmtQty(stockByCode[art.code] || 0)}</td>
+                <td className="num">{objectif > 0 ? fmtQty(objectif) : "—"}</td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -790,7 +901,7 @@ function GrandLivreView({ mouvements, magasinNom }) {
                             </thead>
                             <tbody>
                               {r.detail.map((m) => (
-                                <tr key={m.id}>
+                                <tr key={m.id} className={mvtRowClass(m)}>
                                   <td>{fmtDate(m.date)}</td>
                                   <td>
                                     <MvtPill type={m.type} />
@@ -1110,7 +1221,7 @@ function KardexView({ mouvements, stockByCode, selectedCode, setSelectedCode, ad
                 </thead>
                 <tbody>
                   {historiqueRecentDabord.map((m) => (
-                    <tr key={m.id}>
+                    <tr key={m.id} className={mvtRowClass(m)}>
                       <td>{fmtDate(m.date)}</td>
                       <td>
                         <MvtPill type={m.type} />
@@ -1183,7 +1294,7 @@ function CatalogueView({ stockByCode, objectifsByCode, setObjectif, onOpenArticl
     const stock = stockByCode[code] || 0;
     if (stock <= 0) return false;
     const objectif = objectifsByCode[code] || 0;
-    return objectif > 0 ? stock < objectif : stock <= 5;
+    return objectif > 0 && stock < objectif;
   }
 
   const filtered = useMemo(() => {
@@ -1370,6 +1481,8 @@ export function Style() {
 
       .kx-stats-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:24px; }
       .kx-stat { background:#F7F5EE; border:1px solid #DCD6C4; border-radius:8px; padding:14px 16px; }
+      .kx-stat.clickable { cursor:pointer; transition:box-shadow 0.15s, transform 0.15s; }
+      .kx-stat.clickable:hover { box-shadow:0 4px 14px rgba(27,36,48,0.12); transform:translateY(-1px); }
       .kx-stat.tone-warn { border-color:#D79C8A; background:#FBEFEA; }
       .kx-stat.tone-amber { border-color:#E0C48C; background:#FBF3E1; }
       .kx-stat-label { font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:#8A8272; margin-bottom:6px; }
@@ -1393,7 +1506,9 @@ export function Style() {
       .kx-pill { font-size:10.5px; padding:2px 8px; border-radius:10px; font-weight:600; }
       .kx-pill.in { background:#E1EEE9; color:#2F6F62; }
       .kx-pill.out { background:#F3E1DC; color:#A6432A; }
-      .kx-pill.inv { background:#EDE1F3; color:#6E4A9E; }
+      .kx-pill.inv { background:#6E4A9E; color:#fff; letter-spacing:0.3px; }
+      .kx-row-inventaire td { background:#F1E7FA !important; font-weight:600; border-top:1px solid #D7BFEE; border-bottom:1px solid #D7BFEE; }
+      .kx-row-inventaire td:first-child { border-left:3px solid #6E4A9E; }
       .btn-inv { background:#6E4A9E; }
 
       .kx-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px; }
